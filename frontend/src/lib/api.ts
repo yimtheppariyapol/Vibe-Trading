@@ -105,6 +105,12 @@ export const api = {
       method: "PUT",
       body: JSON.stringify(settings),
     }),
+  listInvestmentOSCandidates: () => request<InvestmentOSCandidatesResponse>("/api/investment-os/candidates"),
+  createStockCoreMemo: (payload: StockCoreMemoRequest) =>
+    request<StockCoreMemoResponse>("/api/investment-os/stock-core-memos", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
 };
 
 // --- Swarm types ---
@@ -178,6 +184,35 @@ export interface DataSourceSettings {
 export interface UpdateDataSourceSettingsRequest {
   tushare_token?: string;
   clear_tushare_token?: boolean;
+}
+
+export interface InvestmentOSCandidate {
+  symbol: string;
+  name: string;
+  role: string;
+  status: string;
+  currency: string;
+  vehicle_type: string;
+  notes: string;
+}
+
+export interface InvestmentOSCandidatesResponse {
+  stock_core_candidates: InvestmentOSCandidate[];
+  source: "file" | "fallback";
+}
+
+export interface StockCoreMemoRequest {
+  symbols: string[];
+  question: string;
+}
+
+export interface StockCoreMemoResponse {
+  status: string;
+  actionability_status: string;
+  file_path: string;
+  relative_path: string;
+  candidate_symbols: string[];
+  message: string;
 }
 
 // --- Types matching backend API contracts ---

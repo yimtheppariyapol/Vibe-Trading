@@ -11,6 +11,7 @@ import hmac
 import ipaddress
 import json
 import os
+import re
 import signal
 import time
 import csv
@@ -137,6 +138,47 @@ class HealthResponse(BaseModel):
     status: str = Field(..., description="Service status")
     service: str = Field(..., description="Service name")
     timestamp: str = Field(..., description="Server timestamp")
+
+
+class InvestmentOSCandidate(BaseModel):
+    """Sanitized Investment OS stock-core candidate."""
+
+    symbol: str
+    name: str
+    role: str
+    status: str
+    currency: str
+    vehicle_type: str
+    notes: str
+
+
+class InvestmentOSCandidatesResponse(BaseModel):
+    """Investment OS candidate registry response."""
+
+    stock_core_candidates: List[InvestmentOSCandidate]
+    source: str
+
+
+class StockCoreMemoRequest(BaseModel):
+    """Create a policy-gated stock-core decision memo draft."""
+
+    symbols: List[str] = Field(default_factory=list, description="Candidate symbols to include. Empty means full menu.")
+    question: str = Field(
+        "Which stock-core implementation should be researched for policy approval?",
+        min_length=1,
+        max_length=500,
+    )
+
+
+class StockCoreMemoResponse(BaseModel):
+    """Created stock-core memo draft metadata."""
+
+    status: str
+    actionability_status: str
+    file_path: str
+    relative_path: str
+    candidate_symbols: List[str]
+    message: str
 
 
 class LLMProviderOption(BaseModel):
@@ -1181,6 +1223,284 @@ async def health_check():
         timestamp=datetime.now().isoformat()
     )
 
+
+def _fallback_investment_os_candidates() -> List[Dict[str, str]]:
+    return [
+        {
+            "symbol": "VT",
+            "name": "Vanguard Total World Stock ETF",
+            "role": "default_global_core",
+            "status": "research_proxy",
+            "currency": "USD",
+            "vehicle_type": "ETF",
+            "notes": "Broad global equity beta proxy used by current backtests.",
+        },
+        {
+            "symbol": "VTI",
+            "name": "Vanguard Total Stock Market ETF",
+            "role": "us_core_alt",
+            "status": "watchlist",
+            "currency": "USD",
+            "vehicle_type": "ETF",
+            "notes": "US total-market alternative for sensitivity review.",
+        },
+        {
+            "symbol": "VOO",
+            "name": "Vanguard S&P 500 ETF",
+            "role": "us_core_alt",
+            "status": "sensitivity_proxy",
+            "currency": "USD",
+            "vehicle_type": "ETF",
+            "notes": "US large-cap comparison proxy already supported by proxy comparison.",
+        },
+        {
+            "symbol": "THB_GLOBAL_FEEDER_TBD",
+            "name": "Thai global equity feeder fund TBD",
+            "role": "thb_access",
+            "status": "research_required",
+            "currency": "THB",
+            "vehicle_type": "Thai feeder fund",
+            "notes": "Placeholder for broker/tax/access research before approval.",
+        },
+    ]
+
+
+def _investment_os_candidate_paths() -> List[Path]:
+    configured = os.environ.get("INVESTMENT_OS_CANDIDATES_PATH", "").strip()
+    paths: List[Path] = []
+    if configured:
+        paths.append(Path(configured))
+    paths.extend(
+        [
+            Path("/investment-os/portfolios/stock_core_candidates.yaml"),
+            AGENT_DIR.parent.parent / "investment-os" / "portfolios" / "stock_core_candidates.yaml",
+        ]
+    )
+    return paths
+
+
+def _load_investment_os_candidates() -> tuple[List[Dict[str, str]], str]:
+    for path in _investment_os_candidate_paths():
+        if not path.exists():
+            continue
+        try:
+            import yaml
+
+            payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Failed to load Investment OS candidates: {exc}")
+
+        candidates = payload.get("stock_core_candidates")
+        if not isinstance(candidates, list):
+            raise HTTPException(status_code=500, detail="Investment OS candidate registry is missing stock_core_candidates")
+        return candidates, "file"
+
+    return _fallback_investment_os_candidates(), "fallback"
+
+
+@app.get("/api/investment-os/candidates", response_model=InvestmentOSCandidatesResponse)
+async def get_investment_os_candidates():
+    """Return sanitized Investment OS stock-core candidates for the Web UI."""
+    candidates, source = _load_investment_os_candidates()
+    return InvestmentOSCandidatesResponse(stock_core_candidates=candidates, source=source)
+
+
+def _investment_os_path(env_name: str, fallback_parts: List[str]) -> Path:
+    configured = os.environ.get(env_name, "").strip()
+    if configured:
+        return Path(configured)
+    mounted = Path("/investment-os").joinpath(*fallback_parts)
+    if mounted.exists() or mounted.parent.exists():
+        return mounted
+    return AGENT_DIR.parent.parent.joinpath("investment-os", *fallback_parts)
+
+
+def _slug(value: str) -> str:
+    slug = re.sub(r"[^a-zA-Z0-9._-]+", "-", value.strip()).strip("-._").lower()
+    return slug or "menu"
+
+
+def _read_text_if_exists(path: Path) -> str:
+    if not path.exists():
+        return ""
+    return path.read_text(encoding="utf-8")
+
+
+def _policy_excerpt(text: str, marker: str, max_chars: int = 700) -> str:
+    if not text:
+        return "TBD - source document unavailable."
+    start = text.find(marker)
+    excerpt = text[start:] if start >= 0 else text
+    excerpt = excerpt.strip().replace("\r\n", "\n")
+    return excerpt[:max_chars].rstrip()
+
+
+def _render_stock_core_memo(question: str, selected: List[Dict[str, str]]) -> str:
+    today = datetime.now().date().isoformat()
+    investment_policy = _read_text_if_exists(_investment_os_path("INVESTMENT_OS_INVESTMENT_POLICY_PATH", ["docs", "investment-policy.md"]))
+    risk_policy = _read_text_if_exists(_investment_os_path("INVESTMENT_OS_RISK_POLICY_PATH", ["docs", "risk-policy.md"]))
+    candidate_rows = "\n".join(
+        f"| {item.get('symbol', 'TBD')} | {item.get('role', 'TBD')} | {item.get('currency', 'TBD')} | "
+        f"{item.get('vehicle_type', 'TBD')} | {item.get('status', 'TBD')} |"
+        for item in selected
+    )
+    candidate_notes = "\n".join(
+        f"- `{item.get('symbol', 'TBD')}`: {item.get('notes', 'TBD')}"
+        for item in selected
+    )
+
+    return f"""# Stock-Core Decision Memo: {' / '.join(item.get('symbol', 'TBD') for item in selected)}
+
+**Date**: {today}
+**Decision supported**: Keep proxy / approve menu / approve vehicle / reject candidate
+**Policy section**: `docs/investment-policy.md#5-strategic-allocation-policy`
+**Risk section**: `docs/risk-policy.md#5-data-quality-requirements`
+**Candidate registry**: `portfolios/stock_core_candidates.yaml`
+**Actionability status**: `research_only`
+
+## 1. Decision Question
+
+{question}
+
+This memo is a policy-gated research draft. It does not approve trades, recommend
+orders, or execute portfolio changes.
+
+## 2. Candidate Summary
+
+| Candidate | Role | Currency | Vehicle type | Status |
+|---|---|---|---|---|
+{candidate_rows}
+
+Candidate notes from the sanitized registry:
+
+{candidate_notes}
+
+## 3. Evidence Table
+
+Every material number needs a source, as-of date, and caveat before this can move
+beyond `research_only`.
+
+| Claim | Source | As-of date | Caveat |
+|---|---|---|---|
+| Expense ratio | TBD | TBD | Required before approval |
+| Assets / liquidity | TBD | TBD | Required before approval |
+| Tracking index | TBD | TBD | Required before approval |
+| Broker availability | TBD | TBD | Required before approval |
+| Tax / withholding notes | TBD | TBD | Required before approval |
+| FX exposure | TBD | TBD | Required before approval |
+
+## 4. Fit Against Policy
+
+- Target bucket: `STOCK_CORE`
+- Current policy source: `docs/investment-policy.md`
+- Current risk source: `docs/risk-policy.md`
+- Proposed target range impact: TBD after vehicle evidence is gathered.
+- BTC interaction: Must respect BTC target range, soft review, and hard max.
+- THB cash interaction: Must respect local idle cash policy.
+- FX review threshold impact: Must evaluate USD-linked exposure for USD vehicles.
+- Rebalance cadence impact: Should use contribution-first rebalancing unless hard limits are breached.
+
+Relevant policy excerpt:
+
+```text
+{_policy_excerpt(investment_policy, '## 5. Strategic Allocation Policy')}
+```
+
+## 5. Risk Review
+
+- Equity concentration risk: TBD
+- Country / sector concentration risk: TBD
+- Currency risk: TBD
+- Tax and withholding risk: TBD
+- Tracking-error risk: TBD
+- Behavioral risk during drawdowns: TBD
+
+Relevant risk excerpt:
+
+```text
+{_policy_excerpt(risk_policy, '## 5. Data Quality Requirements')}
+```
+
+## 6. Backtest And Proxy Review
+
+| Test | Result | Source report | Caveat |
+|---|---|---|---|
+| DCA proxy backtest | TBD | `reports/backtests/...` | Historical research only |
+| Proxy comparison | TBD | `reports/backtests/...` | Proxy may not match selected vehicle |
+| FX-aware result | TBD | `reports/backtests/...` | Yahoo FX data may be imperfect |
+
+## 7. Operational Review
+
+- Account or broker access: TBD
+- Minimum order size / fractional support: TBD
+- Fee and spread considerations: TBD
+- Liquidity constraints: TBD
+- Data availability for ongoing reports: TBD
+- Private-data handling required: Do not include private broker/account data in this public memo draft.
+
+## 8. Options Considered
+
+1. Keep current `VT` research proxy only.
+2. Approve a single global stock-core vehicle.
+3. Approve a menu of stock-core vehicles.
+4. Defer selection and gather more evidence.
+5. Reject the candidate.
+
+## 9. Recommendation Boundary
+
+This memo can support a human decision, but it cannot approve trades or execute
+orders. Any approval must be recorded in `docs/decision-log.md` and reflected in
+the relevant policy docs before reports can treat the vehicle as policy-approved.
+
+## 10. Next Evidence To Gather
+
+- Official fund factsheet / prospectus for each candidate.
+- Expense ratio, AUM, spread/liquidity, tracking index, domicile, and withholding tax notes.
+- Broker availability and currency conversion constraints for Yim's actual account context.
+- Updated FX-aware backtest or proxy comparison if a non-`VT` vehicle becomes primary.
+
+## 11. Decision Log Draft
+
+- Decision: TBD
+- Rationale: TBD
+- Conditions: TBD
+- Review date: TBD
+- Follow-up changes required: TBD
+"""
+
+
+@app.post(
+    "/api/investment-os/stock-core-memos",
+    response_model=StockCoreMemoResponse,
+    dependencies=[Depends(require_local_or_auth)],
+)
+async def create_stock_core_memo(payload: StockCoreMemoRequest):
+    """Create a research-only stock-core decision memo draft in Investment OS."""
+    candidates, _source = _load_investment_os_candidates()
+    by_symbol = {str(item.get("symbol", "")).upper(): item for item in candidates}
+    requested = [symbol.strip().upper() for symbol in payload.symbols if symbol.strip()]
+    selected = [by_symbol[symbol] for symbol in requested if symbol in by_symbol]
+    missing = [symbol for symbol in requested if symbol not in by_symbol]
+    if missing:
+        raise HTTPException(status_code=400, detail=f"Unknown stock-core candidate(s): {', '.join(missing)}")
+    if not selected:
+        selected = candidates
+
+    research_dir = _investment_os_path("INVESTMENT_OS_RESEARCH_DIR", ["research"])
+    research_dir.mkdir(parents=True, exist_ok=True)
+    symbols_slug = _slug("-".join(str(item.get("symbol", "menu")) for item in selected))
+    stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    file_path = research_dir / f"{stamp}_stock-core-{symbols_slug}.md"
+    file_path.write_text(_render_stock_core_memo(payload.question.strip(), selected), encoding="utf-8")
+
+    return StockCoreMemoResponse(
+        status="draft",
+        actionability_status="research_only",
+        file_path=str(file_path),
+        relative_path=f"research/{file_path.name}",
+        candidate_symbols=[str(item.get("symbol", "")) for item in selected],
+        message="Research-only stock-core memo draft created. Human approval is still required before any policy change.",
+    )
 
 @app.get("/correlation")
 async def get_correlation_matrix(

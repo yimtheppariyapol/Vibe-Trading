@@ -7,9 +7,17 @@ services:
       - agent/.env
     environment:
       - VIBE_TRADING_TRUST_DOCKER_LOOPBACK=1
+      - INVESTMENT_OS_CANDIDATES_PATH=/investment-os/portfolios/stock_core_candidates.yaml
+      - INVESTMENT_OS_INVESTMENT_POLICY_PATH=/investment-os/docs/investment-policy.md
+      - INVESTMENT_OS_RISK_POLICY_PATH=/investment-os/docs/risk-policy.md
+      - INVESTMENT_OS_RESEARCH_DIR=/investment-os/research
     volumes:
       - vibe-runs:/app/agent/runs
       - vibe-sessions:/app/agent/sessions
+      - ../investment-os/portfolios/stock_core_candidates.yaml:/investment-os/portfolios/stock_core_candidates.yaml:ro
+      - ../investment-os/docs/investment-policy.md:/investment-os/docs/investment-policy.md:ro
+      - ../investment-os/docs/risk-policy.md:/investment-os/docs/risk-policy.md:ro
+      - ../investment-os/research:/investment-os/research
     restart: unless-stopped
 
   frontend:
