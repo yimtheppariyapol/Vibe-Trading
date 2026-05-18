@@ -1,6 +1,8 @@
-import { useEffect, useState, type FormEvent } from "react";
-import { AlertTriangle, ArrowRight, FileText, Globe2, Loader2, ShieldCheck } from "lucide-react";
-import { api, type InvestmentOSCandidate, type StockCoreMemoResponse } from "@/lib/api";
+import { useCallback, useEffect, useState, type FormEvent } from "react";
+import { AlertTriangle, ArrowRight, Copy, Eye, FileText, Globe2, Loader2, ShieldCheck, Trash2 } from "lucide-react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import { api, type InvestmentOSCandidate, type InvestmentOSMemo, type StockCoreMemoResponse } from "@/lib/api";
 
 const fallbackCandidates: InvestmentOSCandidate[] = [
   {
@@ -53,6 +55,24 @@ function statusClass(status: string) {
   return "border-primary/30 bg-primary/10 text-primary";
 }
 
+function memoStatusClass(status: string) {
+  if (status === "superseded") return "border-warning/30 bg-warning/10 text-warning";
+  if (status === "archived") return "border-muted bg-muted text-muted-foreground";
+  return "border-primary/30 bg-primary/10 text-primary";
+}
+
+function formatDateTime(value: string) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleString(undefined, {
+    year: "numeric",
+    month: "short",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
 export function InvestmentOS() {
   const [candidates, setCandidates] = useState<InvestmentOSCandidate[]>(fallbackCandidates);
   const [source, setSource] = useState<"file" | "fallback">("fallback");
@@ -63,6 +83,28 @@ export function InvestmentOS() {
   const [memoCreating, setMemoCreating] = useState(false);
   const [memoError, setMemoError] = useState<string | null>(null);
   const [memoResult, setMemoResult] = useState<StockCoreMemoResponse | null>(null);
+  const [memos, setMemos] = useState<InvestmentOSMemo[]>([]);
+  const [memosLoading, setMemosLoading] = useState(true);
+  const [memosError, setMemosError] = useState<string | null>(null);
+  const [selectedMemo, setSelectedMemo] = useState<InvestmentOSMemo | null>(null);
+  const [selectedMemoContent, setSelectedMemoContent] = useState<string>("");
+  const [selectedMemoLoading, setSelectedMemoLoading] = useState(false);
+  const [statusUpdatingId, setStatusUpdatingId] = useState<string | null>(null);
+  const [discardingId, setDiscardingId] = useState<string | null>(null);
+  const [copiedPath, setCopiedPath] = useState<string | null>(null);
+
+  const loadMemos = useCallback(async () => {
+    setMemosLoading(true);
+    try {
+      const response = await api.listInvestmentOSMemos();
+      setMemos(response.memos);
+      setMemosError(null);
+    } catch (error) {
+      setMemosError(error instanceof Error ? error.message : "Failed to load research memos");
+    } finally {
+      setMemosLoading(false);
+    }
+  }, []);
 
   useEffect(() => {
     let alive = true;
@@ -83,6 +125,10 @@ export function InvestmentOS() {
     return () => { alive = false; };
   }, []);
 
+  useEffect(() => {
+    void loadMemos();
+  }, [loadMemos]);
+
   const toggleSymbol = (symbol: string) => {
     setSelectedSymbols((current) => (
       current.includes(symbol)
@@ -101,10 +147,74 @@ export function InvestmentOS() {
         question: memoQuestion.trim() || "Which stock-core implementation should be researched for policy approval?",
       });
       setMemoResult(result);
+      await loadMemos();
     } catch (error) {
       setMemoError(error instanceof Error ? error.message : "Failed to create memo draft");
     } finally {
       setMemoCreating(false);
+    }
+  };
+
+  const openMemo = async (memo: InvestmentOSMemo) => {
+    setSelectedMemo(memo);
+    setSelectedMemoLoading(true);
+    try {
+      const response = await api.getInvestmentOSMemo(memo.id);
+      setSelectedMemo(response.memo);
+      setSelectedMemoContent(response.content);
+      setMemos((current) => current.map((item) => (item.id === response.memo.id ? response.memo : item)));
+      setMemosError(null);
+    } catch (error) {
+      setMemosError(error instanceof Error ? error.message : "Failed to open memo review");
+    } finally {
+      setSelectedMemoLoading(false);
+    }
+  };
+
+  const markSuperseded = async (memo: InvestmentOSMemo) => {
+    setStatusUpdatingId(memo.id);
+    try {
+      const updated = await api.updateInvestmentOSMemoStatus(memo.id, "superseded");
+      setMemos((current) => current.map((item) => (item.id === updated.id ? updated : item)));
+      setSelectedMemo((current) => (current?.id === updated.id ? updated : current));
+      setMemosError(null);
+    } catch (error) {
+      setMemosError(error instanceof Error ? error.message : "Failed to mark memo superseded");
+    } finally {
+      setStatusUpdatingId(null);
+    }
+  };
+
+  const discardMemo = async (memo: InvestmentOSMemo) => {
+    const confirmed = window.confirm(
+      `Discard draft?\n\nThis removes ${memo.relative_path} from the active memo list. The Markdown file will be moved to research/.discarded/. No investment decision or policy record will be changed.`
+    );
+    if (!confirmed) return;
+
+    setDiscardingId(memo.id);
+    try {
+      await api.discardInvestmentOSMemo(memo.id);
+      setMemos((current) => current.filter((item) => item.id !== memo.id));
+      if (selectedMemo?.id === memo.id) {
+        setSelectedMemo(null);
+        setSelectedMemoContent("");
+      }
+      setMemosError(null);
+      await loadMemos();
+    } catch (error) {
+      setMemosError(error instanceof Error ? error.message : "Failed to discard memo draft");
+    } finally {
+      setDiscardingId(null);
+    }
+  };
+
+  const copyPath = async (path: string) => {
+    try {
+      await navigator.clipboard.writeText(path);
+      setCopiedPath(path);
+      window.setTimeout(() => setCopiedPath((current) => (current === path ? null : current)), 1800);
+    } catch {
+      setCopiedPath(null);
     }
   };
 
@@ -267,6 +377,182 @@ export function InvestmentOS() {
               ) : null}
             </aside>
           </div>
+        </section>
+
+        <section className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_minmax(420px,0.9fr)]">
+          <div className="rounded-xl border bg-card shadow-sm">
+            <div className="flex flex-col gap-3 border-b p-5 md:flex-row md:items-center md:justify-between">
+              <div>
+                <p className="text-xs uppercase tracking-wide text-muted-foreground">Research memo workspace</p>
+                <h2 className="text-xl font-semibold">Recent research memos</h2>
+              </div>
+              <button
+                type="button"
+                onClick={() => void loadMemos()}
+                disabled={memosLoading}
+                className="inline-flex items-center gap-2 rounded-lg border bg-background px-3 py-2 text-xs font-medium text-muted-foreground transition hover:text-foreground disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {memosLoading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <ArrowRight className="h-3.5 w-3.5" />}
+                Refresh
+              </button>
+            </div>
+
+            {memosError ? (
+              <div className="mx-5 mt-5 rounded-lg border border-warning/30 bg-warning/10 p-3 text-sm text-warning">
+                {memosError}
+              </div>
+            ) : null}
+
+            <div className="space-y-3 p-5">
+              {memosLoading && memos.length === 0 ? (
+                <div className="flex items-center gap-2 rounded-lg border bg-background p-4 text-sm text-muted-foreground">
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                  Loading research memos...
+                </div>
+              ) : null}
+
+              {!memosLoading && memos.length === 0 ? (
+                <div className="rounded-lg border bg-background p-5 text-sm leading-6 text-muted-foreground">
+                  No research memos found yet. Create a draft above to start the review loop.
+                </div>
+              ) : null}
+
+              {memos.map((memo) => (
+                <article
+                  key={memo.id}
+                  className={`rounded-lg border bg-background p-4 transition ${selectedMemo?.id === memo.id ? "border-primary/50 ring-2 ring-primary/10" : ""}`}
+                >
+                  <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+                    <div className="min-w-0 space-y-2">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <h3 className="truncate font-semibold">{memo.title}</h3>
+                        <span className={`rounded-full border px-2 py-0.5 text-xs font-medium ${memoStatusClass(memo.status)}`}>
+                          {memo.status}
+                        </span>
+                        <span className="rounded-full border border-warning/30 bg-warning/10 px-2 py-0.5 text-xs font-medium text-warning">
+                          {memo.actionability_status}
+                        </span>
+                      </div>
+                      <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
+                        <span>Created {formatDateTime(memo.created_at)}</span>
+                        <span>{memo.candidate_symbols.join(", ") || "No symbols parsed"}</span>
+                        <span>{memo.evidence_gap_count} evidence gaps</span>
+                      </div>
+                      <div className="font-mono text-xs text-muted-foreground break-all">{memo.relative_path}</div>
+                    </div>
+
+                    <div className="flex shrink-0 flex-wrap gap-2">
+                      <button
+                        type="button"
+                        onClick={() => void openMemo(memo)}
+                        className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground transition hover:opacity-90"
+                      >
+                        <Eye className="h-3.5 w-3.5" />
+                        Open review
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => void markSuperseded(memo)}
+                        disabled={memo.status === "superseded" || statusUpdatingId === memo.id}
+                        className="inline-flex items-center gap-1.5 rounded-md border bg-background px-3 py-1.5 text-xs font-medium text-muted-foreground transition hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        {statusUpdatingId === memo.id ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
+                        Mark superseded
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => void copyPath(memo.relative_path)}
+                        className="inline-flex items-center gap-1.5 rounded-md border bg-background px-3 py-1.5 text-xs font-medium text-muted-foreground transition hover:text-foreground"
+                      >
+                        <Copy className="h-3.5 w-3.5" />
+                        {copiedPath === memo.relative_path ? "Copied" : "Copy path"}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => void discardMemo(memo)}
+                        disabled={discardingId === memo.id}
+                        className="inline-flex items-center gap-1.5 rounded-md border border-danger/30 bg-background px-3 py-1.5 text-xs font-medium text-danger transition hover:bg-danger/10 disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        {discardingId === memo.id ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Trash2 className="h-3.5 w-3.5" />}
+                        Discard draft
+                      </button>
+                    </div>
+                  </div>
+                </article>
+              ))}
+            </div>
+          </div>
+
+          <aside className="rounded-xl border bg-card shadow-sm">
+            <div className="border-b p-5">
+              <p className="text-xs uppercase tracking-wide text-muted-foreground">Memo review</p>
+              <h2 className="text-xl font-semibold">Open inside the cockpit</h2>
+            </div>
+
+            {selectedMemo ? (
+              <div className="space-y-4 p-5">
+                <div className="space-y-2">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className={`rounded-full border px-2 py-0.5 text-xs font-medium ${memoStatusClass(selectedMemo.status)}`}>
+                      {selectedMemo.status}
+                    </span>
+                    <span className="rounded-full border border-warning/30 bg-warning/10 px-2 py-0.5 text-xs font-medium text-warning">
+                      {selectedMemo.actionability_status}
+                    </span>
+                  </div>
+                  <h3 className="text-lg font-semibold">{selectedMemo.title}</h3>
+                  <div className="font-mono text-xs text-muted-foreground break-all">{selectedMemo.relative_path}</div>
+                </div>
+
+                <div className="flex flex-wrap gap-2">
+                  <button
+                    type="button"
+                    onClick={() => void markSuperseded(selectedMemo)}
+                    disabled={selectedMemo.status === "superseded" || statusUpdatingId === selectedMemo.id}
+                    className="inline-flex items-center gap-1.5 rounded-md border bg-background px-3 py-1.5 text-xs font-medium text-muted-foreground transition hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    {statusUpdatingId === selectedMemo.id ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
+                    Mark superseded
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void copyPath(selectedMemo.relative_path)}
+                    className="inline-flex items-center gap-1.5 rounded-md border bg-background px-3 py-1.5 text-xs font-medium text-muted-foreground transition hover:text-foreground"
+                  >
+                    <Copy className="h-3.5 w-3.5" />
+                    {copiedPath === selectedMemo.relative_path ? "Copied" : "Copy path"}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void discardMemo(selectedMemo)}
+                    disabled={discardingId === selectedMemo.id}
+                    className="inline-flex items-center gap-1.5 rounded-md border border-danger/30 bg-background px-3 py-1.5 text-xs font-medium text-danger transition hover:bg-danger/10 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    {discardingId === selectedMemo.id ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Trash2 className="h-3.5 w-3.5" />}
+                    Discard draft
+                  </button>
+                </div>
+
+                <div className="max-h-[640px] overflow-auto rounded-lg border bg-background p-4 text-sm leading-6">
+                  {selectedMemoLoading ? (
+                    <div className="flex items-center gap-2 text-muted-foreground">
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                      Loading memo review...
+                    </div>
+                  ) : (
+                    <div className="prose prose-sm max-w-none dark:prose-invert prose-headings:font-semibold prose-table:text-xs prose-th:border prose-th:px-2 prose-th:py-1 prose-td:border prose-td:px-2 prose-td:py-1">
+                      <ReactMarkdown remarkPlugins={[remarkGfm]}>{selectedMemoContent}</ReactMarkdown>
+                    </div>
+                  )}
+                </div>
+              </div>
+            ) : (
+              <div className="p-5 text-sm leading-6 text-muted-foreground">
+                Select <span className="font-medium text-foreground">Open review</span> from a recent memo.
+                The cockpit renders Markdown here so the raw file path stays traceability metadata, not the workflow.
+              </div>
+            )}
+          </aside>
         </section>
 
         <section className="rounded-xl border bg-card shadow-sm">

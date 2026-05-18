@@ -181,6 +181,40 @@ class StockCoreMemoResponse(BaseModel):
     message: str
 
 
+class InvestmentOSMemo(BaseModel):
+    """Investment OS research memo metadata for cockpit list views."""
+
+    id: str
+    relative_path: str
+    title: str
+    status: str
+    actionability_status: str
+    candidate_symbols: List[str]
+    created_at: str
+    updated_at: str
+    evidence_gap_count: int
+
+
+class InvestmentOSMemosResponse(BaseModel):
+    """Investment OS research memo list response."""
+
+    memos: List[InvestmentOSMemo]
+    source: str
+
+
+class InvestmentOSMemoContentResponse(BaseModel):
+    """Investment OS research memo content response."""
+
+    memo: InvestmentOSMemo
+    content: str
+
+
+class InvestmentOSMemoStatusRequest(BaseModel):
+    """Update non-destructive research memo workflow status."""
+
+    status: str = Field(..., description="Allowed values: draft, superseded, archived")
+
+
 class LLMProviderOption(BaseModel):
     """Supported LLM provider metadata for the settings UI."""
 
@@ -1305,6 +1339,91 @@ async def get_investment_os_candidates():
     return InvestmentOSCandidatesResponse(stock_core_candidates=candidates, source=source)
 
 
+@app.get("/api/investment-os/memos", response_model=InvestmentOSMemosResponse)
+async def list_investment_os_memos():
+    """Return recent non-destructive Investment OS research memo metadata."""
+    research_dir = _investment_os_research_dir()
+    if not research_dir.exists():
+        return InvestmentOSMemosResponse(memos=[], source="missing")
+
+    statuses = _load_investment_os_memo_statuses(research_dir)
+    memo_files = sorted(
+        [path for path in research_dir.glob("*.md") if _is_investment_os_memo_file(path)],
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    return InvestmentOSMemosResponse(
+        memos=[_build_investment_os_memo_metadata(path, statuses) for path in memo_files],
+        source="file",
+    )
+
+
+@app.get("/api/investment-os/memos/{memo_id}", response_model=InvestmentOSMemoContentResponse)
+async def get_investment_os_memo(memo_id: str):
+    """Return a single Investment OS research memo for in-cockpit review."""
+    research_dir = _investment_os_research_dir()
+    memo_path = _investment_os_memo_path(memo_id, research_dir)
+    if not memo_path.exists() or not memo_path.is_file():
+        raise HTTPException(status_code=404, detail="memo not found")
+
+    statuses = _load_investment_os_memo_statuses(research_dir)
+    return InvestmentOSMemoContentResponse(
+        memo=_build_investment_os_memo_metadata(memo_path, statuses),
+        content=memo_path.read_text(encoding="utf-8"),
+    )
+
+
+@app.post(
+    "/api/investment-os/memos/{memo_id}/status",
+    response_model=InvestmentOSMemo,
+    dependencies=[Depends(require_local_or_auth)],
+)
+async def update_investment_os_memo_status(memo_id: str, payload: InvestmentOSMemoStatusRequest):
+    """Update research memo status without deleting or rewriting the memo artifact."""
+    status_value = payload.status.strip().lower()
+    if status_value not in _INVESTMENT_OS_MEMO_STATUSES:
+        raise HTTPException(status_code=400, detail="status must be draft, superseded, or archived")
+
+    research_dir = _investment_os_research_dir()
+    memo_path = _investment_os_memo_path(memo_id, research_dir)
+    if not memo_path.exists() or not memo_path.is_file():
+        raise HTTPException(status_code=404, detail="memo not found")
+
+    statuses = _load_investment_os_memo_statuses(research_dir)
+    statuses[memo_path.name] = status_value
+    _write_investment_os_memo_statuses(statuses, research_dir)
+    return _build_investment_os_memo_metadata(memo_path, statuses)
+
+
+@app.post(
+    "/api/investment-os/memos/{memo_id}/discard",
+    response_model=InvestmentOSMemo,
+    dependencies=[Depends(require_local_or_auth)],
+)
+async def discard_investment_os_memo(memo_id: str):
+    """Soft-delete a memo draft by moving it out of the active research list."""
+    research_dir = _investment_os_research_dir()
+    memo_path = _investment_os_memo_path(memo_id, research_dir)
+    if not memo_path.exists() or not memo_path.is_file():
+        raise HTTPException(status_code=404, detail="memo not found")
+
+    statuses = _load_investment_os_memo_statuses(research_dir)
+    metadata = _build_investment_os_memo_metadata(memo_path, {**statuses, memo_path.name: "discarded"})
+
+    discarded_dir = _investment_os_discarded_dir(research_dir)
+    discarded_dir.mkdir(parents=True, exist_ok=True)
+    discarded_path = discarded_dir / memo_path.name
+    if discarded_path.exists():
+        stamp = datetime.now().strftime("%Y%m%d%H%M%S")
+        discarded_path = discarded_dir / f"{memo_path.stem}-{stamp}{memo_path.suffix}"
+    memo_path.replace(discarded_path)
+
+    statuses.pop(memo_path.name, None)
+    statuses[discarded_path.name] = "discarded"
+    _write_investment_os_memo_statuses(statuses, research_dir)
+    return metadata
+
+
 def _investment_os_path(env_name: str, fallback_parts: List[str]) -> Path:
     configured = os.environ.get(env_name, "").strip()
     if configured:
@@ -1324,6 +1443,114 @@ def _read_text_if_exists(path: Path) -> str:
     if not path.exists():
         return ""
     return path.read_text(encoding="utf-8")
+
+
+_INVESTMENT_OS_MEMO_ID_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{6}_[A-Za-z0-9._-]{1,160}\.md$")
+_INVESTMENT_OS_MEMO_STATUSES = {"draft", "superseded", "archived", "discarded"}
+
+
+def _investment_os_research_dir() -> Path:
+    return _investment_os_path("INVESTMENT_OS_RESEARCH_DIR", ["research"])
+
+
+def _investment_os_memo_status_path(research_dir: Optional[Path] = None) -> Path:
+    return (research_dir or _investment_os_research_dir()) / "memo-status.json"
+
+
+def _investment_os_discarded_dir(research_dir: Optional[Path] = None) -> Path:
+    return (research_dir or _investment_os_research_dir()) / ".discarded"
+
+
+def _load_investment_os_memo_statuses(research_dir: Optional[Path] = None) -> Dict[str, str]:
+    status_path = _investment_os_memo_status_path(research_dir)
+    if not status_path.exists():
+        return {}
+    try:
+        payload = json.loads(status_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    return {
+        str(memo_id): str(memo_status)
+        for memo_id, memo_status in payload.items()
+        if str(memo_status) in _INVESTMENT_OS_MEMO_STATUSES
+    }
+
+
+def _write_investment_os_memo_statuses(statuses: Dict[str, str], research_dir: Optional[Path] = None) -> None:
+    target_dir = research_dir or _investment_os_research_dir()
+    target_dir.mkdir(parents=True, exist_ok=True)
+    status_path = _investment_os_memo_status_path(target_dir)
+    status_path.write_text(json.dumps(statuses, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _validate_investment_os_memo_id(memo_id: str) -> str:
+    candidate = Path(memo_id).name
+    if candidate != memo_id or not _INVESTMENT_OS_MEMO_ID_RE.fullmatch(candidate):
+        raise HTTPException(status_code=400, detail="invalid memo id")
+    return candidate
+
+
+def _is_investment_os_memo_file(path: Path) -> bool:
+    return path.is_file() and bool(_INVESTMENT_OS_MEMO_ID_RE.fullmatch(path.name))
+
+
+def _investment_os_memo_path(memo_id: str, research_dir: Optional[Path] = None) -> Path:
+    safe_id = _validate_investment_os_memo_id(memo_id)
+    base_dir = (research_dir or _investment_os_research_dir()).resolve()
+    memo_path = (base_dir / safe_id).resolve()
+    if memo_path.parent != base_dir:
+        raise HTTPException(status_code=400, detail="invalid memo id")
+    return memo_path
+
+
+def _parse_investment_os_memo_created_at(memo_id: str, file_path: Path) -> str:
+    prefix = memo_id[:17]
+    try:
+        return datetime.strptime(prefix, "%Y-%m-%d_%H%M%S").isoformat()
+    except ValueError:
+        return datetime.fromtimestamp(file_path.stat().st_mtime).isoformat()
+
+
+def _extract_investment_os_memo_title(content: str, memo_id: str) -> str:
+    for line in content.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("# "):
+            return stripped[2:].strip() or memo_id
+    return memo_id.removesuffix(".md").replace("_", " ")
+
+
+def _extract_investment_os_actionability(content: str) -> str:
+    match = re.search(r"\*\*Actionability status\*\*:\s*`?([A-Za-z0-9_-]+)`?", content)
+    if match:
+        return match.group(1)
+    return "research_only"
+
+
+def _extract_investment_os_memo_symbols(content: str, title: str) -> List[str]:
+    source = title
+    if ":" in source:
+        source = source.split(":", 1)[1]
+    symbols = [part.strip().strip("`") for part in re.split(r"\s*/\s*|,", source) if part.strip()]
+    return symbols
+
+
+def _build_investment_os_memo_metadata(file_path: Path, statuses: Dict[str, str]) -> InvestmentOSMemo:
+    content = _read_text_if_exists(file_path)
+    memo_id = file_path.name
+    title = _extract_investment_os_memo_title(content, memo_id)
+    return InvestmentOSMemo(
+        id=memo_id,
+        relative_path=f"research/{memo_id}",
+        title=title,
+        status=statuses.get(memo_id, "draft"),
+        actionability_status=_extract_investment_os_actionability(content),
+        candidate_symbols=_extract_investment_os_memo_symbols(content, title),
+        created_at=_parse_investment_os_memo_created_at(memo_id, file_path),
+        updated_at=datetime.fromtimestamp(file_path.stat().st_mtime).isoformat(),
+        evidence_gap_count=content.count("TBD"),
+    )
 
 
 def _policy_excerpt(text: str, marker: str, max_chars: int = 700) -> str:

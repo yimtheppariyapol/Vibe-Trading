@@ -106,6 +106,17 @@ export const api = {
       body: JSON.stringify(settings),
     }),
   listInvestmentOSCandidates: () => request<InvestmentOSCandidatesResponse>("/api/investment-os/candidates"),
+  listInvestmentOSMemos: () => request<InvestmentOSMemosResponse>("/api/investment-os/memos"),
+  getInvestmentOSMemo: (id: string) => request<InvestmentOSMemoContentResponse>(`/api/investment-os/memos/${encodeURIComponent(id)}`),
+  updateInvestmentOSMemoStatus: (id: string, status: InvestmentOSMemoStatus) =>
+    request<InvestmentOSMemo>(`/api/investment-os/memos/${encodeURIComponent(id)}/status`, {
+      method: "POST",
+      body: JSON.stringify({ status }),
+    }),
+  discardInvestmentOSMemo: (id: string) =>
+    request<InvestmentOSMemo>(`/api/investment-os/memos/${encodeURIComponent(id)}/discard`, {
+      method: "POST",
+    }),
   createStockCoreMemo: (payload: StockCoreMemoRequest) =>
     request<StockCoreMemoResponse>("/api/investment-os/stock-core-memos", {
       method: "POST",
@@ -199,6 +210,30 @@ export interface InvestmentOSCandidate {
 export interface InvestmentOSCandidatesResponse {
   stock_core_candidates: InvestmentOSCandidate[];
   source: "file" | "fallback";
+}
+
+export type InvestmentOSMemoStatus = "draft" | "superseded" | "archived" | "discarded";
+
+export interface InvestmentOSMemo {
+  id: string;
+  relative_path: string;
+  title: string;
+  status: InvestmentOSMemoStatus;
+  actionability_status: string;
+  candidate_symbols: string[];
+  created_at: string;
+  updated_at: string;
+  evidence_gap_count: number;
+}
+
+export interface InvestmentOSMemosResponse {
+  memos: InvestmentOSMemo[];
+  source: "file" | "missing";
+}
+
+export interface InvestmentOSMemoContentResponse {
+  memo: InvestmentOSMemo;
+  content: string;
 }
 
 export interface StockCoreMemoRequest {
